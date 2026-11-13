@@ -1,5 +1,6 @@
 import asyncio
 import html
+import io
 import logging
 import os
 import re
@@ -23,7 +24,24 @@ BASE_URL = os.getenv("BASE_URL", "https://your-openai-compatible-endpoint/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "claude-opus-5-5")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))  # твой Telegram ID (узнать у @userinfobot)
 
-SYSTEM_PROMPT = "Ты полезный ассистент. Отвечай по существу."
+SYSTEM_PROMPT = """Ты опытный senior-разработчик и наставник. Отвечай на языке пользователя (по умолчанию на русском).
+Пользователь — новичок: объясняй простыми словами, но без воды.
+
+Правила ответа:
+1. Сначала одно-два предложения о сути решения, затем полный рабочий код, затем как его запустить.
+2. Код всегда полный и готовый к запуску, без заглушек вроде «...» и «остальное без изменений».
+   Если правишь существующий файл, показывай изменённые фрагменты целиком и пиши, куда их вставить.
+3. Всегда указывай язык в блоках кода (```python, ```bash и т.д.).
+4. Если нужны сторонние библиотеки, пиши команду установки.
+5. Не выдумывай функции и параметры библиотек. Если не уверен, так и скажи.
+6. Если данных не хватает, задай один короткий уточняющий вопрос или выбери разумное допущение и назови его.
+7. При ошибке: объясни причину простыми словами, дай исправление и скажи, как проверить, что оно сработало.
+8. Напоминай о безопасности: ключи, пароли и токены нельзя хранить в коде и выкладывать на GitHub.
+9. Если прислан файл, сначала кратко опиши, что он делает, затем выполни просьбу пользователя.
+10. Не пиши лишних вступлений и повторов."""
+
+MAX_FILE_BYTES = 100_000    # максимальный размер присланного файла (байты)
+MAX_FILE_CHARS = 60_000     # сколько символов файла отправлять модели
 MAX_HISTORY_MESSAGES = 40   # сколько последних сообщений хранить в контексте
 CHUNK_LIMIT = 3500          # безопасный размер одной части (лимит Telegram — 4096)
 MAX_PARTS = 4               # если частей больше — отправляем ответ файлом .md
@@ -155,7 +173,7 @@ async def send_long(message: Message, text: str) -> None:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
-        "Привет! Просто напиши сообщение — я передам его модели.\n"
+        "Привет! Напиши сообщение или пришли файл (код, txt, md, json, csv, PDF).\n"
         "/clear — очистить историю диалога.",
         parse_mode=None,
     )
@@ -168,10 +186,9 @@ async def cmd_clear(message: Message) -> None:
     await message.answer("История диалога очищена.", parse_mode=None)
 
 
-@router.message(F.text)
-async def handle_text(message: Message, bot: Bot) -> None:
+async def process_prompt(message: Message, bot: Bot, user_content: str) -> None:
     async with history_lock:
-        history.append({"role": "user", "content": message.text})
+        history.append({"role": "user", "content": user_content})
         del history[:-MAX_HISTORY_MESSAGES]
         while history and history[0]["role"] != "user":
             history.pop(0)
@@ -196,9 +213,84 @@ async def handle_text(message: Message, bot: Bot) -> None:
     await send_long(message, answer)
 
 
+def decode_text(data: bytes) -> str | None:
+    """Пытается прочитать файл как текст. Бинарные файлы возвращают None."""
+    if b"\x00" in data[:2048]:
+        return None
+    for encoding in ("utf-8", "cp1251"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def extract_pdf(data: bytes) -> str | None:
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        return text.strip() or None
+    except Exception:
+        logging.exception("Не удалось прочитать PDF")
+        return None
+
+
+@router.message(F.text)
+async def handle_text(message: Message, bot: Bot) -> None:
+    await process_prompt(message, bot, message.text)
+
+
+@router.message(F.document)
+async def handle_document(message: Message, bot: Bot) -> None:
+    doc = message.document
+    name = doc.file_name or "file"
+
+    if doc.file_size and doc.file_size > MAX_FILE_BYTES:
+        await message.answer(
+            f"Файл слишком большой. Максимум — {MAX_FILE_BYTES // 1000} КБ.",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        buf = io.BytesIO()
+        await bot.download(doc, destination=buf)
+        data = buf.getvalue()
+    except Exception as e:
+        logging.exception("Не удалось скачать файл")
+        await message.answer(f"Не удалось скачать файл: {e}"[:4000], parse_mode=None)
+        return
+
+    if name.lower().endswith(".pdf"):
+        text = extract_pdf(data)
+    else:
+        text = decode_text(data)
+
+    if not text:
+        await message.answer(
+            "Не получилось прочитать файл. Поддерживаются текстовые файлы "
+            "(код, txt, md, json, csv и т.п.) и PDF с текстом.",
+            parse_mode=None,
+        )
+        return
+
+    note = ""
+    if len(text) > MAX_FILE_CHARS:
+        text = text[:MAX_FILE_CHARS]
+        note = f"\n[Файл обрезан до первых {MAX_FILE_CHARS} символов]"
+
+    caption = (message.caption or "").strip() or "Проанализируй этот файл."
+    content = f"{caption}\n\n--- Файл: {name} ---\n{text}{note}\n--- Конец файла ---"
+    await process_prompt(message, bot, content)
+
+
 @router.message()
 async def handle_other(message: Message) -> None:
-    await message.answer("Я понимаю только текстовые сообщения.", parse_mode=None)
+    await message.answer(
+        "Я понимаю текст и файлы (код, txt, PDF). Фото и голосовые пока не поддерживаются.",
+        parse_mode=None,
+    )
 
 
 async def health(request: web.Request) -> web.Response:
