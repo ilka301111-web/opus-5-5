@@ -10,7 +10,8 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message)
 from aiogram.utils.chat_action import ChatActionSender
 from aiohttp import web
 from openai import AsyncOpenAI
@@ -21,7 +22,9 @@ from openai import AsyncOpenAI
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 API_KEY = os.getenv("API_KEY", "")
 BASE_URL = os.getenv("BASE_URL", "https://your-openai-compatible-endpoint/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "claude-opus-5-5")
+MODEL_NAME = os.getenv("MODEL_NAME", "claude-opus-5-5")          # основная модель (Opus)
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "claude-sonnet-5-5")  # запасная, если Opus не отвечает
+CHEAP_MODEL = os.getenv("CHEAP_MODEL", "claude-haiku-5-5")         # дешёвая (для ручного выбора)
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))  # твой Telegram ID (узнать у @userinfobot)
 
 SYSTEM_PROMPT = """Ты опытный senior-разработчик и наставник. Отвечай на языке пользователя (по умолчанию на русском).
@@ -49,12 +52,62 @@ MAX_PARTS = 4               # если частей больше — отпра�
 
 logging.basicConfig(level=logging.INFO)
 
-client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
+# max_retries=0: при ошибке (например, 429) сразу переходим на запасную модель, а не ждём повторов
+client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, max_retries=0, timeout=180)
 router = Router()
 router.message.filter(F.from_user.id == ALLOWED_USER_ID)  # чужие сообщения игнорируются
+router.callback_query.filter(F.from_user.id == ALLOWED_USER_ID)
 
 history: list[dict] = []
 history_lock = asyncio.Lock()
+
+# Режим выбора модели: "auto" (Opus, а при сбое Sonnet) или конкретный ключ из MODEL_CHOICES
+MODEL_CHOICES = {"opus": MODEL_NAME, "sonnet": FALLBACK_MODEL, "haiku": CHEAP_MODEL}
+state = {"mode": "auto"}
+
+
+async def ask_model(messages: list[dict]) -> tuple[str, str, str]:
+    """Возвращает (ответ, имя использованной модели, примечание)."""
+    if state["mode"] == "auto":
+        chain = [MODEL_NAME, FALLBACK_MODEL]
+    else:
+        chain = [MODEL_CHOICES[state["mode"]]]
+
+    errors: list[str] = []
+    for i, model in enumerate(chain):
+        try:
+            response = await client.chat.completions.create(model=model, messages=messages)
+            text = response.choices[0].message.content or ""
+            if not text.strip():
+                raise RuntimeError("пустой ответ")
+            note = f" (основная модель {MODEL_NAME} недоступна)" if i > 0 else ""
+            return text, model, note
+        except Exception as e:
+            logging.warning("Модель %s не ответила: %s", model, e)
+            errors.append(f"{model}: {e}")
+    raise RuntimeError("\n".join(errors))
+
+
+def model_keyboard() -> InlineKeyboardMarkup:
+    def label(key: str, title: str) -> str:
+        return ("✅ " if state["mode"] == key else "") + title
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=label("auto", "Авто (Opus → Sonnet)"), callback_data="model:auto")],
+        [
+            InlineKeyboardButton(text=label("opus", "Opus"), callback_data="model:opus"),
+            InlineKeyboardButton(text=label("sonnet", "Sonnet"), callback_data="model:sonnet"),
+            InlineKeyboardButton(text=label("haiku", "Haiku"), callback_data="model:haiku"),
+        ],
+    ])
+
+
+def mode_text() -> str:
+    if state["mode"] == "auto":
+        current = f"Авто: сначала {MODEL_NAME}, если не отвечает — {FALLBACK_MODEL}"
+    else:
+        current = f"Только {MODEL_CHOICES[state['mode']]}"
+    return f"Текущий режим: {current}\n\nВыбери модель:"
 
 
 # ---------- Форматирование: Markdown -> безопасный Telegram HTML ----------
@@ -174,9 +227,27 @@ async def send_long(message: Message, text: str) -> None:
 async def cmd_start(message: Message) -> None:
     await message.answer(
         "Привет! Напиши сообщение или пришли файл (код, txt, md, json, csv, PDF).\n"
-        "/clear — очистить историю диалога.",
+        "/clear — очистить историю диалога.\n"
+        "/model — выбрать модель (Авто, Opus, Sonnet, Haiku).",
         parse_mode=None,
     )
+
+
+@router.message(Command("model"))
+async def cmd_model(message: Message) -> None:
+    await message.answer(mode_text(), reply_markup=model_keyboard(), parse_mode=None)
+
+
+@router.callback_query(F.data.startswith("model:"))
+async def on_model_choice(callback: CallbackQuery) -> None:
+    choice = callback.data.split(":", 1)[1]
+    if choice == "auto" or choice in MODEL_CHOICES:
+        state["mode"] = choice
+    try:
+        await callback.message.edit_text(mode_text(), reply_markup=model_keyboard(), parse_mode=None)
+    except TelegramBadRequest:
+        pass  # режим не изменился, текст тот же
+    await callback.answer("Готово")
 
 
 @router.message(Command("clear"))
@@ -197,20 +268,17 @@ async def process_prompt(message: Message, bot: Bot, user_content: str) -> None:
 
         try:
             async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-                response = await client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                )
-            answer = response.choices[0].message.content or ""
+                answer, used_model, note = await ask_model(messages)
         except Exception as e:
             logging.exception("Ошибка при обращении к API")
             history.pop()  # убираем сообщение, на которое не получили ответ
-            await message.answer(f"Ошибка API: {e}"[:4000], parse_mode=None)
+            await message.answer(f"Ошибка API:\n{e}"[:4000], parse_mode=None)
             return
 
         history.append({"role": "assistant", "content": answer})
 
-    await send_long(message, answer)
+    # подпись с названием модели; в историю она не попадает
+    await send_long(message, f"{answer.strip()}\n\n🤖 {used_model}{note}")
 
 
 def decode_text(data: bytes) -> str | None:
