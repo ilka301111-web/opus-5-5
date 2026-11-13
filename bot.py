@@ -1,9 +1,12 @@
 import asyncio
+import base64
 import html
 import io
 import logging
 import os
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -22,29 +25,17 @@ from openai import AsyncOpenAI
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 API_KEY = os.getenv("API_KEY", "")
 BASE_URL = os.getenv("BASE_URL", "https://your-openai-compatible-endpoint/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "claude-opus-5-5")          # основная модель (Opus)
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "claude-sonnet-5-5")  # запасная, если Opus не отвечает
-CHEAP_MODEL = os.getenv("CHEAP_MODEL", "claude-haiku-5-5")         # дешёвая (для ручного выбора)
+MODEL_NAME = os.getenv("MODEL_NAME", "claude-opus-5-5")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))  # твой Telegram ID (узнать у @userinfobot)
 
-SYSTEM_PROMPT = """Ты опытный senior-разработчик и наставник. Отвечай на языке пользователя (по умолчанию на русском).
-Пользователь — новичок: объясняй простыми словами, но без воды.
+MAX_FILE_BYTES = 20_000_000  # лимит Telegram на скачивание файлов ботом — 20 МБ
+MAX_FILE_CHARS = int(os.getenv("MAX_FILE_CHARS", "300000"))  # сколько символов файла отправлять модели
 
-Правила ответа:
-1. Сначала одно-два предложения о сути решения, затем полный рабочий код, затем как его запустить.
-2. Код всегда полный и готовый к запуску, без заглушек вроде «...» и «остальное без изменений».
-   Если правишь существующий файл, показывай изменённые фрагменты целиком и пиши, куда их вставить.
-3. Всегда указывай язык в блоках кода (```python, ```bash и т.д.).
-4. Если нужны сторонние библиотеки, пиши команду установки.
-5. Не выдумывай функции и параметры библиотек. Если не уверен, так и скажи.
-6. Если данных не хватает, задай один короткий уточняющий вопрос или выбери разумное допущение и назови его.
-7. При ошибке: объясни причину простыми словами, дай исправление и скажи, как проверить, что оно сработало.
-8. Напоминай о безопасности: ключи, пароли и токены нельзя хранить в коде и выкладывать на GitHub.
-9. Если прислан файл, сначала кратко опиши, что он делает, затем выполни просьбу пользователя.
-10. Не пиши лишних вступлений и повторов."""
-
-MAX_FILE_BYTES = 100_000    # максимальный размер присланного файла (байты)
-MAX_FILE_CHARS = 60_000     # сколько символов файла отправлять модели
+# Мышление и длина ответа (настраиваются на Render в Environment):
+# THINKING_BUDGET > 0 включает расширенное мышление с таким бюджетом токенов (0 = выключено).
+# MAX_OUTPUT_TOKENS = 0 — не ограничивать длину ответа (решает провайдер).
+THINKING_BUDGET = int(os.getenv("THINKING_BUDGET", "0"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "0"))
 MAX_HISTORY_MESSAGES = 40   # сколько последних сообщений хранить в контексте
 CHUNK_LIMIT = 3500          # безопасный размер одной части (лимит Telegram — 4096)
 MAX_PARTS = 4               # если частей больше — отправляем ответ файлом .md
@@ -52,8 +43,7 @@ MAX_PARTS = 4               # если частей больше — отпра�
 
 logging.basicConfig(level=logging.INFO)
 
-# max_retries=0: при ошибке (например, 429) сразу переходим на запасную модель, а не ждём повторов
-client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, max_retries=0, timeout=180)
+client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=900)
 router = Router()
 router.message.filter(F.from_user.id == ALLOWED_USER_ID)  # чужие сообщения игнорируются
 router.callback_query.filter(F.from_user.id == ALLOWED_USER_ID)
@@ -61,53 +51,78 @@ router.callback_query.filter(F.from_user.id == ALLOWED_USER_ID)
 history: list[dict] = []
 history_lock = asyncio.Lock()
 
-# Режим выбора модели: "auto" (Opus, а при сбое Sonnet) или конкретный ключ из MODEL_CHOICES
-MODEL_CHOICES = {"opus": MODEL_NAME, "sonnet": FALLBACK_MODEL, "haiku": CHEAP_MODEL}
-state = {"mode": "auto"}
+# Уровни мышления (бюджет токенов). Переключаются командой /lvl.
+THINKING_LEVELS = {
+    "off": ("Выкл", 0),
+    "low": ("Низкое", 2000),
+    "mid": ("Среднее", 8000),
+    "high": ("Высокое", 16000),
+    "max": ("Максимум", 32000),
+}
+state = {"thinking": THINKING_BUDGET, "brevity": "normal"}  # мышление: старт из THINKING_BUDGET
+
+# Краткость ответа (команда /short). Мышление при этом не урезается:
+# в запрос добавляется короткая инструкция только про длину итогового ответа.
+BREVITY_LEVELS = {
+    "normal": ("Обычно", ""),
+    "short": (
+        "Кратко",
+        "Отвечай кратко и по делу: только суть, без вступлений, лишних пояснений и повторов. "
+        "Если нужен код, приводи его полностью.",
+    ),
+    "tiny": (
+        "Очень кратко",
+        "Отвечай максимально кратко: одно-три предложения или только нужный код. "
+        "Подробности давай, только если о них попросят.",
+    ),
+}
 
 
-async def ask_model(messages: list[dict]) -> tuple[str, str, str]:
-    """Возвращает (ответ, имя использованной модели, примечание)."""
-    if state["mode"] == "auto":
-        chain = [MODEL_NAME, FALLBACK_MODEL]
-    else:
-        chain = [MODEL_CHOICES[state["mode"]]]
-
-    errors: list[str] = []
-    for i, model in enumerate(chain):
-        try:
-            response = await client.chat.completions.create(model=model, messages=messages)
-            text = response.choices[0].message.content or ""
-            if not text.strip():
-                raise RuntimeError("пустой ответ")
-            note = f" (основная модель {MODEL_NAME} недоступна)" if i > 0 else ""
-            return text, model, note
-        except Exception as e:
-            logging.warning("Модель %s не ответила: %s", model, e)
-            errors.append(f"{model}: {e}")
-    raise RuntimeError("\n".join(errors))
+def brevity_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            text=("✅ " if state["brevity"] == key else "") + title,
+            callback_data=f"short:{key}",
+        )
+        for key, (title, _) in BREVITY_LEVELS.items()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-def model_keyboard() -> InlineKeyboardMarkup:
-    def label(key: str, title: str) -> str:
-        return ("✅ " if state["mode"] == key else "") + title
-
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=label("auto", "Авто (Opus → Sonnet)"), callback_data="model:auto")],
-        [
-            InlineKeyboardButton(text=label("opus", "Opus"), callback_data="model:opus"),
-            InlineKeyboardButton(text=label("sonnet", "Sonnet"), callback_data="model:sonnet"),
-            InlineKeyboardButton(text=label("haiku", "Haiku"), callback_data="model:haiku"),
-        ],
-    ])
+def brevity_text() -> str:
+    title = BREVITY_LEVELS[state["brevity"]][0]
+    return (
+        f"Длина ответа: {title}\n\n"
+        "Мышление модели остаётся прежним (его уровень задаётся в /lvl), "
+        "сокращается только итоговый ответ."
+    )
 
 
-def mode_text() -> str:
-    if state["mode"] == "auto":
-        current = f"Авто: сначала {MODEL_NAME}, если не отвечает — {FALLBACK_MODEL}"
-    else:
-        current = f"Только {MODEL_CHOICES[state['mode']]}"
-    return f"Текущий режим: {current}\n\nВыбери модель:"
+def thinking_title() -> str:
+    budget = state["thinking"]
+    for title, value in THINKING_LEVELS.values():
+        if value == budget:
+            return f"{title} ({value} токенов)" if value else "Выкл"
+    return f"свой бюджет ({budget} токенов)"
+
+
+def thinking_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            text=("✅ " if state["thinking"] == value else "") + title,
+            callback_data=f"think:{key}",
+        )
+        for key, (title, value) in THINKING_LEVELS.items()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[buttons[:2], buttons[2:]])
+
+
+def thinking_text() -> str:
+    return (
+        f"Мышление: {thinking_title()}\n\n"
+        "Чем выше уровень, тем глубже думает модель, но тем больше уходит токенов и времени. "
+        "Если после включения приходит «Ошибка API», выбери «Выкл»."
+    )
 
 
 # ---------- Форматирование: Markdown -> безопасный Telegram HTML ----------
@@ -226,27 +241,45 @@ async def send_long(message: Message, text: str) -> None:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
-        "Привет! Напиши сообщение или пришли файл (код, txt, md, json, csv, PDF).\n"
+        "Привет! Пришли текст, файл (код, txt, md, json, csv, PDF, DOCX, XLSX, PPTX) или фото.\n"
         "/clear — очистить историю диалога.\n"
-        "/model — выбрать модель (Авто, Opus, Sonnet, Haiku).",
+        "/lvl — настроить глубину мышления модели.\n"
+        "/short — сделать ответы короткими (мышление сохраняется).",
         parse_mode=None,
     )
 
 
-@router.message(Command("model"))
-async def cmd_model(message: Message) -> None:
-    await message.answer(mode_text(), reply_markup=model_keyboard(), parse_mode=None)
+@router.message(Command("short"))
+async def cmd_short(message: Message) -> None:
+    await message.answer(brevity_text(), reply_markup=brevity_keyboard(), parse_mode=None)
 
 
-@router.callback_query(F.data.startswith("model:"))
-async def on_model_choice(callback: CallbackQuery) -> None:
-    choice = callback.data.split(":", 1)[1]
-    if choice == "auto" or choice in MODEL_CHOICES:
-        state["mode"] = choice
+@router.callback_query(F.data.startswith("short:"))
+async def on_brevity_choice(callback: CallbackQuery) -> None:
+    key = callback.data.split(":", 1)[1]
+    if key in BREVITY_LEVELS:
+        state["brevity"] = key
     try:
-        await callback.message.edit_text(mode_text(), reply_markup=model_keyboard(), parse_mode=None)
+        await callback.message.edit_text(brevity_text(), reply_markup=brevity_keyboard(), parse_mode=None)
     except TelegramBadRequest:
-        pass  # режим не изменился, текст тот же
+        pass  # выбран тот же режим — текст не изменился
+    await callback.answer("Готово")
+
+
+@router.message(Command("lvl"))
+async def cmd_thinking(message: Message) -> None:
+    await message.answer(thinking_text(), reply_markup=thinking_keyboard(), parse_mode=None)
+
+
+@router.callback_query(F.data.startswith("think:"))
+async def on_thinking_choice(callback: CallbackQuery) -> None:
+    key = callback.data.split(":", 1)[1]
+    if key in THINKING_LEVELS:
+        state["thinking"] = THINKING_LEVELS[key][1]
+    try:
+        await callback.message.edit_text(thinking_text(), reply_markup=thinking_keyboard(), parse_mode=None)
+    except TelegramBadRequest:
+        pass  # выбран тот же уровень — текст не изменился
     await callback.answer("Готово")
 
 
@@ -257,28 +290,48 @@ async def cmd_clear(message: Message) -> None:
     await message.answer("История диалога очищена.", parse_mode=None)
 
 
-async def process_prompt(message: Message, bot: Bot, user_content: str) -> None:
+async def process_prompt(message: Message, bot: Bot, user_content, history_text: str | None = None) -> None:
+    """user_content — строка или список частей (текст + изображение).
+    history_text — что сохранить в историю вместо тяжёлого содержимого (например, фото)."""
     async with history_lock:
         history.append({"role": "user", "content": user_content})
         del history[:-MAX_HISTORY_MESSAGES]
         while history and history[0]["role"] != "user":
             history.pop(0)
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+        messages = list(history)
+        instruction = BREVITY_LEVELS[state["brevity"]][1]
+        if instruction:
+            messages = [{"role": "system", "content": instruction}, *messages]
+
+        kwargs: dict = {}
+        budget = state["thinking"]
+        if budget > 0:
+            kwargs["extra_body"] = {"thinking": {"type": "enabled", "budget_tokens": budget}}
+            kwargs["max_tokens"] = budget + (MAX_OUTPUT_TOKENS or 16000)
+        elif MAX_OUTPUT_TOKENS > 0:
+            kwargs["max_tokens"] = MAX_OUTPUT_TOKENS
 
         try:
             async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-                answer, used_model, note = await ask_model(messages)
+                response = await client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    **kwargs,
+                )
+            answer = response.choices[0].message.content or ""
         except Exception as e:
             logging.exception("Ошибка при обращении к API")
             history.pop()  # убираем сообщение, на которое не получили ответ
-            await message.answer(f"Ошибка API:\n{e}"[:4000], parse_mode=None)
+            hint = "\n\nПодсказка: мышление включено, попробуй /lvl → Выкл." if budget > 0 else ""
+            await message.answer(f"Ошибка API: {e}{hint}"[:4000], parse_mode=None)
             return
 
+        if history_text is not None:
+            history[-1] = {"role": "user", "content": history_text}  # фото не храним — экономим токены
         history.append({"role": "assistant", "content": answer})
 
-    # подпись с названием модели; в историю она не попадает
-    await send_long(message, f"{answer.strip()}\n\n🤖 {used_model}{note}")
+    await send_long(message, answer)
 
 
 def decode_text(data: bytes) -> str | None:
@@ -304,6 +357,94 @@ def extract_pdf(data: bytes) -> str | None:
         return None
 
 
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+
+def extract_docx(data: bytes) -> str | None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            root = ET.fromstring(z.read("word/document.xml"))
+        paragraphs = ["".join(t.text or "" for t in p.iter(_W + "t")) for p in root.iter(_W + "p")]
+        return "\n".join(paragraphs).strip() or None
+    except Exception:
+        logging.exception("Не удалось прочитать DOCX")
+        return None
+
+
+def extract_pptx(data: bytes) -> str | None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = [n for n in z.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)]
+            names.sort(key=lambda n: int(re.findall(r"\d+", n)[0]))
+            parts = []
+            for i, n in enumerate(names, 1):
+                root = ET.fromstring(z.read(n))
+                texts = [t.text or "" for t in root.iter(_A + "t")]
+                parts.append(f"[Слайд {i}]\n" + "\n".join(texts))
+        return "\n\n".join(parts).strip() or None
+    except Exception:
+        logging.exception("Не удалось прочитать PPTX")
+        return None
+
+
+def extract_xlsx(data: bytes) -> str | None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+                shared = ["".join(t.text or "" for t in si.iter(_S + "t")) for si in root.iter(_S + "si")]
+            names = [n for n in z.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)]
+            names.sort(key=lambda n: int(re.findall(r"\d+", n)[0]))
+            parts = []
+            for i, n in enumerate(names, 1):
+                root = ET.fromstring(z.read(n))
+                rows = []
+                for row in root.iter(_S + "row"):
+                    cells = []
+                    for c in row.iter(_S + "c"):
+                        v = c.find(_S + "v")
+                        if c.get("t") == "s" and v is not None and v.text is not None:
+                            cells.append(shared[int(v.text)] if int(v.text) < len(shared) else "")
+                        elif c.get("t") == "inlineStr":
+                            cells.append("".join(t.text or "" for t in c.iter(_S + "t")))
+                        else:
+                            cells.append(v.text if v is not None and v.text else "")
+                    rows.append("\t".join(cells))
+                parts.append(f"[Лист {i}]\n" + "\n".join(rows))
+        return "\n\n".join(parts).strip() or None
+    except Exception:
+        logging.exception("Не удалось прочитать XLSX")
+        return None
+
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+async def process_image(message: Message, bot: Bot, file_obj, mime: str) -> None:
+    buf = io.BytesIO()
+    try:
+        await bot.download(file_obj, destination=buf)
+    except Exception as e:
+        logging.exception("Не удалось скачать изображение")
+        await message.answer(f"Не удалось скачать изображение: {e}"[:4000], parse_mode=None)
+        return
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    caption = (message.caption or "").strip() or "Опиши и проанализируй это изображение."
+    content = [
+        {"type": "text", "text": caption},
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+    ]
+    await process_prompt(message, bot, content, history_text=f"[Изображение] {caption}")
+
+
+@router.message(F.photo)
+async def handle_photo(message: Message, bot: Bot) -> None:
+    await process_image(message, bot, message.photo[-1], "image/jpeg")
+
+
 @router.message(F.text)
 async def handle_text(message: Message, bot: Bot) -> None:
     await process_prompt(message, bot, message.text)
@@ -316,9 +457,15 @@ async def handle_document(message: Message, bot: Bot) -> None:
 
     if doc.file_size and doc.file_size > MAX_FILE_BYTES:
         await message.answer(
-            f"Файл слишком большой. Максимум — {MAX_FILE_BYTES // 1000} КБ.",
+            f"Файл слишком большой. Максимум — {MAX_FILE_BYTES // 1_000_000} МБ.",
             parse_mode=None,
         )
+        return
+
+    lower = name.lower()
+    if (doc.mime_type or "").startswith("image/") or lower.endswith(IMAGE_EXTS):
+        mime = doc.mime_type if (doc.mime_type or "").startswith("image/") else "image/jpeg"
+        await process_image(message, bot, doc, mime)
         return
 
     try:
@@ -330,15 +477,21 @@ async def handle_document(message: Message, bot: Bot) -> None:
         await message.answer(f"Не удалось скачать файл: {e}"[:4000], parse_mode=None)
         return
 
-    if name.lower().endswith(".pdf"):
+    if lower.endswith(".pdf"):
         text = extract_pdf(data)
+    elif lower.endswith(".docx"):
+        text = extract_docx(data)
+    elif lower.endswith(".pptx"):
+        text = extract_pptx(data)
+    elif lower.endswith(".xlsx"):
+        text = extract_xlsx(data)
     else:
         text = decode_text(data)
 
     if not text:
         await message.answer(
             "Не получилось прочитать файл. Поддерживаются текстовые файлы "
-            "(код, txt, md, json, csv и т.п.) и PDF с текстом.",
+            "(код, txt, md, json, csv и т.п.), PDF с текстом, DOCX, XLSX, PPTX и изображения.",
             parse_mode=None,
         )
         return
@@ -356,7 +509,8 @@ async def handle_document(message: Message, bot: Bot) -> None:
 @router.message()
 async def handle_other(message: Message) -> None:
     await message.answer(
-        "Я понимаю текст и файлы (код, txt, PDF). Фото и голосовые пока не поддерживаются.",
+        "Я понимаю текст, файлы (код, txt, PDF, DOCX, XLSX, PPTX) и изображения. "
+        "Голосовые, видео и стикеры не поддерживаются.",
         parse_mode=None,
     )
 
